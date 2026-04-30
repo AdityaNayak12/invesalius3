@@ -384,10 +384,9 @@ class MarkerVisualizer:
     def SetTargetTransparency(self, marker, transparent):
         actor = marker.visualization["actor"]
         if transparent:
-            actor.GetProperty().SetOpacity(1)
-            # actor.GetProperty().SetOpacity(0.4)
+            actor.GetProperty().SetOpacity(0.4)  # Set to semi-transparent
         else:
-            actor.GetProperty().SetOpacity(1)
+            actor.GetProperty().SetOpacity(1)    # Set to fully opaque
 
     def _CreateProjectionLine(self, startpoint_position, startpoint_orientation):
         """
