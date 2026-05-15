@@ -1122,9 +1122,6 @@ class Slice(metaclass=utils.Singleton):
         """
         It gets the from actual mask the given slice from given orientation
         """
-        # It's necessary because the first position for each dimension from
-        # mask matrix is used as flags to control if the mask in the
-        # slice_number position has been generated.
         if (
             self.buffer_slices[orientation].index == slice_number
             and self.buffer_slices[orientation].mask is not None
@@ -1134,17 +1131,19 @@ class Slice(metaclass=utils.Singleton):
 
         target_matrix = self.matrix
         if self.current_mask:
-            derived = getattr(self.current_mask, "derived_from", "Original")
-            proj = Project()
-            for lbl, mat in proj.image_versions:
-                if lbl == derived:
-                    target_matrix = mat
-                    break
+            derived = getattr(self.current_mask, "derived_from", "original")
+            if derived.lower() != "original":
+                proj = Project()
+                for lbl, mat in proj.image_versions:
+                    if lbl == derived:
+                        target_matrix = mat
+                        break
 
         if orientation == "AXIAL":
             if self.current_mask.matrix[n, 0, 0] == 0:
                 mask = self.current_mask.matrix[n, 1:, 1:]
-                mask[:] = self.do_threshold_to_a_slice(target_matrix[slice_number], mask)
+                image_slice = target_matrix[slice_number]
+                mask[:] = self.do_threshold_to_a_slice(image_slice, mask)
                 self.current_mask.matrix[n, 0, 0] = 1
             n_mask = np.array(
                 self.current_mask.matrix[n, 1:, 1:],
@@ -1154,7 +1153,8 @@ class Slice(metaclass=utils.Singleton):
         elif orientation == "CORONAL":
             if self.current_mask.matrix[0, n, 0] == 0:
                 mask = self.current_mask.matrix[1:, n, 1:]
-                mask[:] = self.do_threshold_to_a_slice(target_matrix[:, slice_number, :], mask)
+                image_slice = target_matrix[:, slice_number, :]
+                mask[:] = self.do_threshold_to_a_slice(image_slice, mask)
                 self.current_mask.matrix[0, n, 0] = 1
             n_mask = np.array(
                 self.current_mask.matrix[1:, n, 1:],
@@ -1164,7 +1164,8 @@ class Slice(metaclass=utils.Singleton):
         elif orientation == "SAGITAL":
             if self.current_mask.matrix[0, 0, n] == 0:
                 mask = self.current_mask.matrix[1:, 1:, n]
-                mask[:] = self.do_threshold_to_a_slice(target_matrix[:, :, slice_number], mask)
+                image_slice = target_matrix[:, :, slice_number]
+                mask[:] = self.do_threshold_to_a_slice(image_slice, mask)
                 self.current_mask.matrix[0, 0, n] = 1
             n_mask = np.array(
                 self.current_mask.matrix[1:, 1:, n],
@@ -1919,13 +1920,76 @@ class Slice(metaclass=utils.Singleton):
         os.close(temp_fd)
         os.remove(temp_file)
 
+        # Flush the reoriented image matrix to disk
+        if hasattr(self.matrix, "flush"):
+            self.matrix.flush()
+        if hasattr(self, "matrix_filename"):
+            try:
+                fd = os.open(self.matrix_filename, os.O_RDWR)
+                os.fsync(fd)
+                os.close(fd)
+            except (OSError, AttributeError):
+                pass
+
         self.q_orientation = np.array((1, 0, 0, 0))
         self.center = [(s * d / 2.0) for (d, s) in zip(self.matrix.shape[::-1], self.spacing)]
 
-        self.__clean_current_mask()
-        if self.current_mask:
-            self.current_mask.matrix[:] = 0
-            self.current_mask.was_edited = False
+        proj = Project()
+        new_shape = self.matrix.shape
+
+        # Update image_versions to point to the reoriented matrix
+        if proj.image_versions:
+            current_label = getattr(self, "current_image_label", "original")
+            for i, (label, mat) in enumerate(proj.image_versions):
+                if label == current_label or mat is self.matrix:
+                    proj.image_versions[i] = (label, self.matrix)
+                    break
+
+        for mask in proj.mask_dict.values():
+            new_mask_shape = (new_shape[0] + 1, new_shape[1] + 1, new_shape[2] + 1)
+
+            # If mask was manually edited, transform it along with the image
+            if mask.was_edited:
+                # Create temporary file for mask transformation
+                mask_temp_fd, mask_temp_file = tempfile.mkstemp()
+                mask_copy = np.memmap(
+                    mask_temp_file, shape=mask.matrix.shape, dtype=mask.matrix.dtype, mode="w+"
+                )
+                mask_copy[:] = mask.matrix
+
+                # Recreate mask matrix with new shape if needed
+                if mask.matrix.shape != new_mask_shape:
+                    mask._recreate_mask_matrix(new_mask_shape)
+
+                # Apply the same transformation to the mask
+                # Use nearest neighbor interpolation to preserve discrete mask values
+                transforms.apply_view_matrix_transform(
+                    mask_copy,
+                    self.spacing,
+                    M,
+                    0,
+                    "AXIAL",
+                    0,  # 0 = nearest neighbor interpolation
+                    0,
+                    mask.matrix,
+                )
+
+                del mask_copy
+                os.close(mask_temp_fd)
+                os.remove(mask_temp_file)
+
+                mask.matrix.flush()
+                os.fsync(mask.temp_fd)
+            else:
+                # For threshold-based masks, just resize and clear
+                if mask.matrix.shape != new_mask_shape:
+                    mask._recreate_mask_matrix(new_mask_shape)
+
+                mask.matrix[:] = 0
+                mask.matrix.flush()
+                os.fsync(mask.temp_fd)
+
+            mask.clear_history()
 
         for o in self.buffer_slices:
             self.buffer_slices[o].discard_buffer()
